@@ -1,0 +1,796 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Coca-Cola New Year Ad</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="gl" width="1920" height="1080"></canvas>
+<canvas id="out" width="1920" height="1080"></canvas>
+<script id="vs" type="x-shader">#version 300 es
+in vec2 aPos;
+void main(){ gl_Position = vec4(aPos,0.0,1.0); }
+</script>
+
+<!-- ===================== SCENE PASS ===================== -->
+<script id="fsScene" type="x-shader">#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec3 uCamPos, uCamTgt;
+uniform float uTanFov, uFocus, uAper;
+uniform sampler2D uLabel;
+out vec4 fragColor;
+
+#define PI 3.14159265
+const float FILL = 1.60;      // liquid level (bottle local y)
+const float GLASS_TOP = 1.975;
+const vec3  BP = vec3(0.0,-0.03,0.0); // bottle base position
+const vec3  KEY_DIR = normalize(vec3(-0.55,0.42,-0.72));
+const vec3  KEY_COL = vec3(1.0,0.62,0.30)*2.2;
+const vec3  MOON_DIR = normalize(vec3(0.65,0.75,0.45));
+const vec3  MOON_COL = vec3(0.42,0.52,0.85)*0.75;
+const vec3  FRONT_DIR = normalize(vec3(0.25,0.35,1.0));
+const vec3  FRONT_COL = vec3(1.0,0.82,0.62)*0.55;
+
+float pxScale; vec3 cFw, cRt, cUp;
+
+// ---------- hashes / noise ----------
+float hash11(float p){ p = fract(p*.1031); p *= p+33.33; p *= p+p; return fract(p); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+float hash13(vec3 p3){ p3 = fract(p3*.1031); p3 += dot(p3,p3.zyx+31.32); return fract((p3.x+p3.y)*p3.z); }
+vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*vec3(.1031,.1030,.0973)); p3 += dot(p3,p3.yzx+33.33); return fract((p3.xx+p3.yz)*p3.zy); }
+vec3 hash33(vec3 p3){ p3 = fract(p3*vec3(.1031,.1030,.0973)); p3 += dot(p3,p3.yxz+33.33); return fract((p3.xxy+p3.yxx)*p3.zyx); }
+float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.-2.*f);
+  return mix(mix(hash12(i),hash12(i+vec2(1,0)),u.x), mix(hash12(i+vec2(0,1)),hash12(i+vec2(1,1)),u.x),u.y); }
+float fbm(vec2 p){ float s=0., a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+17.1; a*=.5; } return s; }
+float smax(float a,float b,float k){ float h=clamp(.5-.5*(b-a)/k,0.,1.); return mix(b,a,h)+k*h*(1.-h); }
+
+// ---------- bottle ----------
+const float RK[21] = float[21](0.262,0.303,0.316,0.313,0.299,0.291,0.298,0.311,0.316,0.316,0.316,
+                               0.316,0.316,0.302,0.263,0.215,0.175,0.146,0.131,0.125,0.125);
+float profile(float y){
+  float x = clamp(y,0.,2.)*10.;
+  int i = min(int(floor(x)),19); float f = x-float(i);
+  float p0=RK[max(i-1,0)], p1=RK[i], p2=RK[i+1], p3=RK[min(i+2,20)];
+  float r = 0.5*((2.*p1)+(-p0+p2)*f+(2.*p0-5.*p1+4.*p2-p3)*f*f+(-p0+3.*p1-3.*p2+p3)*f*f*f);
+  r += 0.017*smoothstep(1.895,1.925,y)*(1.-smoothstep(1.95,1.972,y)); // lip
+  return r;
+}
+float fluteMask(float y){
+  return smoothstep(0.07,0.13,y)*(1.-smoothstep(0.64,0.73,y)) + smoothstep(1.27,1.34,y)*(1.-smoothstep(1.60,1.72,y));
+}
+float sdGlass(vec3 p){
+  vec3 q = p-BP;
+  float a = atan(q.z,q.x);
+  float r = profile(q.y) - fluteMask(q.y)*0.0065*(0.5+0.5*cos(a*14.));
+  float d = (length(q.xz)-r)*0.82;
+  d = smax(d,-q.y,0.03);
+  d = smax(d,q.y-GLASS_TOP,0.006);
+  return d;
+}
+float sdCap(vec3 p){
+  vec3 q = p-BP;
+  float a = atan(q.z,q.x);
+  float crimp = 0.0045*(0.5+0.5*cos(a*21.))*(1.-smoothstep(1.985,2.02,q.y));
+  float rc = 0.141 + crimp;
+  vec2 d2 = vec2(length(q.xz)-rc+0.008, abs(q.y-2.005)-0.052+0.008);
+  return (min(max(d2.x,d2.y),0.)+length(max(d2,0.))-0.008)*0.9;
+}
+// ---------- ground ----------
+float groundH(vec2 xz){
+  float h = 0.06*fbm(xz*0.9) + 0.018*vnoise(xz*3.3+5.0) + 0.006*vnoise(xz*11.0) - 0.04;
+  vec2 d = xz-BP.xz;
+  h += 0.085*exp(-dot(d,d)*4.5);             // drift around the bottle
+  h += 0.25*smoothstep(3.0,12.0,-xz.y)*fbm(xz*0.25); // far dunes
+  return h;
+}
+const vec4 ORN[3] = vec4[3](vec4(0.78,0.11,0.42,0.135), vec4(-0.66,0.09,0.55,0.11), vec4(-0.30,0.05,1.05,0.065));
+float sdOrn(vec3 p, out int id){
+  float d = 1e3; id = 0;
+  for(int i=0;i<3;i++){
+    vec3 q = p-ORN[i].xyz;
+    float ds = length(q)-ORN[i].w;
+    // little metal cap on top
+    vec3 cq = q-vec3(0.0,ORN[i].w*0.95,0.0);
+    vec2 cd = vec2(length(cq.xz)-ORN[i].w*0.22, abs(cq.y)-ORN[i].w*0.12);
+    float dc = min(max(cd.x,cd.y),0.)+length(max(cd,0.));
+    if(ds<d){ d=ds; id=i*2; }
+    if(dc<d){ d=dc; id=i*2+1; }
+  }
+  return d;
+}
+vec2 map(vec3 p){
+  float g = (p.y-groundH(p.xz))*0.7;
+  int oid; float o = sdOrn(p,oid);
+  float b = sdGlass(p);
+  float c = sdCap(p);
+  vec2 r = vec2(g,3.);
+  if(b<r.x) r = vec2(b,1.);
+  if(c<r.x) r = vec2(c,2.);
+  if(o<r.x) r = vec2(o,4.+float(oid));
+  return r;
+}
+float mapBottle(vec3 p){ int k; return min(min(sdGlass(p),sdCap(p)),sdOrn(p,k)); }
+vec3 nOrn(vec3 p){ const vec2 k=vec2(1,-1); const float e=0.0005; int i;
+  return normalize(k.xyy*sdOrn(p+k.xyy*e,i)+k.yyx*sdOrn(p+k.yyx*e,i)+k.yxy*sdOrn(p+k.yxy*e,i)+k.xxx*sdOrn(p+k.xxx*e,i)); }
+vec3 nGlass(vec3 p){ const vec2 k=vec2(1,-1); const float e=0.0007;
+  return normalize(k.xyy*sdGlass(p+k.xyy*e)+k.yyx*sdGlass(p+k.yyx*e)+k.yxy*sdGlass(p+k.yxy*e)+k.xxx*sdGlass(p+k.xxx*e)); }
+vec3 nCap(vec3 p){ const vec2 k=vec2(1,-1); const float e=0.0007;
+  return normalize(k.xyy*sdCap(p+k.xyy*e)+k.yyx*sdCap(p+k.yyx*e)+k.yxy*sdCap(p+k.yxy*e)+k.xxx*sdCap(p+k.xxx*e)); }
+vec3 nGround(vec3 p){ float e=0.004;
+  return normalize(vec3(groundH(p.xz-vec2(e,0))-groundH(p.xz+vec2(e,0)), 2.*e, groundH(p.xz-vec2(0,e))-groundH(p.xz+vec2(0,e)))); }
+
+// ---------- christmas lights ----------
+void lightInfo(int i, out vec3 pos, out vec3 col, out float inten){
+  float fi = float(i);
+  float h1 = hash11(fi*1.37+0.1), h2 = hash11(fi*2.71+3.3), h3 = hash11(fi*5.13+7.7);
+  if(i<80){ // big tree, back-left
+    float h = h1*4.6; float r = ((1.0-h/5.0)*1.9+0.05)*(0.55+0.45*sqrt(hash11(fi*9.1))); float a = h2*6.2831;
+    pos = vec3(-2.7,0.25,-7.8) + vec3(cos(a)*r, h, sin(a)*r);
+  } else if(i<120){ // small tree, back-right
+    float h = h1*3.6; float r = (1.0-h/3.9)*1.4+0.05; float a = h2*6.2831;
+    pos = vec3(4.2,0.25,-11.5) + vec3(cos(a)*r, h, sin(a)*r);
+  } else { // garland
+    float k = (fi-120.)/39.;
+    float x = mix(-7.,7.,k);
+    float seg = fract(k*3.0);
+    pos = vec3(x, 3.1-0.7*sin(seg*PI), -5.2-1.5*k*k);
+  }
+  float c = h3;
+  col = c<0.55 ? vec3(1.0,0.66,0.30) : c<0.75 ? vec3(1.0,0.18,0.10) : c<0.88 ? vec3(1.0,0.88,0.70) : c<0.95 ? vec3(0.35,1.0,0.45) : vec3(0.45,0.65,1.0);
+  inten = 0.75+0.25*sin(uTime*(1.5+h2*2.)+h1*40.);
+}
+const int NLIGHTS = 160;
+
+vec3 sky(vec3 rd){
+  float y = rd.y;
+  vec3 c = mix(vec3(0.020,0.032,0.075), vec3(0.002,0.006,0.026), smoothstep(-0.05,0.45,y));
+  // warm haze around the tree and town glow
+  vec3 dT = normalize(vec3(-2.7,2.3,-7.8)-uCamPos);
+  c += vec3(0.30,0.14,0.05)*0.22*pow(max(dot(rd,dT),0.),24.);
+  vec3 dT2 = normalize(vec3(4.2,1.8,-11.5)-uCamPos);
+  c += vec3(0.30,0.14,0.05)*0.12*pow(max(dot(rd,dT2),0.),30.);
+  c += vec3(0.16,0.10,0.08)*0.05*exp(-abs(y)*9.);
+  return c;
+}
+// environment for reflections / refractions (studio strips + blurred lights)
+vec3 env(vec3 rd){
+  vec3 c = sky(rd);
+  if(rd.y<0.0) c = mix(c, vec3(0.20,0.21,0.26)+vec3(0.18,0.10,0.05)*0.6, smoothstep(0.0,-0.08,rd.y));
+  float az = atan(rd.x,rd.z);
+  float el = smoothstep(-0.12,0.05,rd.y)*smoothstep(0.85,0.55,rd.y);
+  c += vec3(1.0,0.75,0.5)*3.2*smoothstep(0.13,0.08,abs(az+2.05))*el;   // warm strip back-left
+  c += vec3(0.85,0.9,1.0)*2.2*smoothstep(0.10,0.06,abs(az-1.25))*el;   // cool strip right
+  c += vec3(1.0,0.9,0.8)*0.9*smoothstep(0.35,0.2,abs(az-0.2))*smoothstep(0.2,0.6,rd.y)*smoothstep(1.0,0.75,rd.y); // soft top-front
+  for(int i=0;i<NLIGHTS;i+=3){
+    vec3 lp,lc; float li; lightInfo(i,lp,lc,li);
+    vec3 dl = normalize(lp);
+    float a = 1.0-dot(rd,dl);
+    c += lc*li*2.0*exp(-a*9000.0);
+  }
+  return c;
+}
+// background with true bokeh discs
+vec3 background(vec3 rd){
+  vec3 c = sky(rd);
+  vec2 uvp = vec2(dot(rd,cRt),dot(rd,cUp))/dot(rd,cFw);
+  for(int i=0;i<NLIGHTS;i++){
+    vec3 lp,lc; float li; lightInfo(i,lp,lc,li);
+    vec3 v = lp-uCamPos;
+    float z = dot(v,cFw); if(z<0.5) continue;
+    vec2 sp = vec2(dot(v,cRt),dot(v,cUp))/z;
+    float coc = uAper*abs(z-uFocus)/(z*uFocus);       // radius in tan-space
+    float rad = max(coc, 0.0025);
+    float d = length(uvp-sp)/rad;
+    if(d>1.05) continue;
+    float edge = 1.0/(rad*pxScale);
+    float disc = smoothstep(1.0, 1.0-1.6*edge-0.02, d);
+    float rim = 1.0+0.35*smoothstep(0.6,0.97,d);
+    float energy = 0.0045/rad;                          // larger discs are dimmer
+    c += lc*li*disc*rim*clamp(energy,0.08,2.5)*0.9;
+  }
+  return c;
+}
+
+// soft shadow towards the key light through the bottle, returns occlusion 0..1
+float bottleShadow(vec3 ro, vec3 rd){
+  float res=1.0, t=0.02;
+  for(int i=0;i<36;i++){
+    float h = mapBottle(ro+rd*t);
+    res = min(res, 10.0*h/t);
+    t += clamp(h,0.01,0.2);
+    if(res<0.001||t>4.0) break;
+  }
+  return clamp(res,0.,1.);
+}
+
+vec3 shadeSnow(vec3 p, vec3 rd, float t, bool simple){
+  vec3 n = nGround(p);
+  // fine sparkle normals
+  vec3 alb = vec3(0.90,0.93,1.0);
+  float occK = simple ? 1.0 : bottleShadow(p+n*0.01, KEY_DIR);
+  float occF = simple ? 1.0 : bottleShadow(p+n*0.01, FRONT_DIR);
+  float wrapK = clamp((dot(n,KEY_DIR)+0.15)/1.15,0.,1.);
+  float wrapM = clamp((dot(n,MOON_DIR)+0.3)/1.3,0.,1.);
+  vec3 col = alb*(vec3(0.035,0.05,0.10) + MOON_COL*wrapM*0.5 + FRONT_COL*0.22*max(dot(n,FRONT_DIR),0.)*occF);
+  // key light passes through the cola: red/amber caustic shadow
+  vec3 shTint = mix(vec3(0.55,0.10,0.02), vec3(1.0), occK);
+  float caus = (1.0-occK)*0.6;
+  col += alb*KEY_COL*wrapK*wrapK*0.38*shTint + vec3(1.0,0.35,0.08)*caus*0.35*wrapK;
+  // warm bounce from the lights
+  col += vec3(0.20,0.10,0.04)*0.12*smoothstep(-1.0,1.0,-p.z);
+  if(!simple){
+    // glitter
+    vec3 cp = floor(p*90.0);
+    float hh = hash13(cp);
+    if(hh>0.94){
+      vec3 rn = normalize(hash33(cp)*2.0-1.0+vec3(0,0.6,0));
+      float g = pow(max(dot(reflect(rd,rn),normalize(KEY_DIR+vec3(0.2*sin(uTime*0.7),0,0))),0.),180.0);
+      float g2 = pow(max(dot(reflect(rd,rn),MOON_DIR),0.),220.0);
+      vec3 fp = fract(p*90.0)-0.5; float s = smoothstep(0.35,0.0,length(fp));
+      col += (KEY_COL*g*6.0 + vec3(0.8,0.9,1.0)*g2*6.0)*s;
+    }
+  }
+  // fog into the night background
+  float fog = smoothstep(4.0,12.0,t);
+  col *= mix(1.0,0.55,smoothstep(2.0,7.0,t));
+  return col*(1.0-fog);
+}
+
+vec3 transmitSample(vec3 ro, vec3 rd){
+  // what is seen through the bottle: snow ground or environment
+  if(rd.y<-0.02){
+    float t = (0.0-ro.y)/rd.y;
+    vec3 p = ro+rd*t;
+    return shadeSnow(p,rd,t+3.0,true)*1.1 + vec3(0.02);
+  }
+  return env(rd);
+}
+
+// --- bubbles: analytic vertical streams ---
+vec3 bubbles(vec3 e, vec3 d, float T){
+  vec3 acc = vec3(0);
+  vec3 q = e-BP;
+  for(int k=0;k<16;k++){
+    float fk=float(k);
+    float rr = sqrt(hash11(fk*3.1+1.))*0.21; float aa = hash11(fk*7.7+2.)*6.2831;
+    vec2 s = vec2(cos(aa),sin(aa))*rr;
+    vec2 w = q.xz-s; vec2 dd = d.xz;
+    float tt = clamp(-dot(w,dd)/max(dot(dd,dd),1e-5),0.,T);
+    float y = q.y+d.y*tt;
+    if(y>FILL-0.01||y<0.05) continue;
+    float spacing = 0.035+0.06*hash11(fk*1.9+5.);
+    float speed = 0.18+0.25*hash11(fk*4.3+9.);
+    float ph = (y-uTime*speed)/spacing;
+    float id = floor(ph);
+    float wob = 0.006*sin(id*12.9+uTime*6.);
+    float d2 = length(w+dd*tt+vec2(wob,0));
+    float dy = (fract(ph)-0.5)*spacing;
+    float rb = 0.0035+0.006*hash11(id+fk*13.);
+    float dist = length(vec2(d2,dy));
+    float ring = smoothstep(rb,rb*0.75,dist)*(0.35+0.65*smoothstep(rb*0.45,rb*0.85,dist));
+    float present = step(0.25,hash11(id*1.7+fk));
+    vec3 att = exp(-vec3(1.6,4.6,8.5)*tt);
+    acc += ring*present*att*vec3(1.0,0.85,0.65)*2.2;
+  }
+  return acc;
+}
+
+vec3 shadeBottle(vec3 p, vec3 rd, float matId){
+  vec3 q = p-BP;
+  if(matId>1.5){ // cap: red painted crimped metal
+    vec3 n = nCap(p);
+    vec3 r = reflect(rd,n);
+    float fr = 0.5+0.5*pow(1.-max(dot(-rd,n),0.),5.);
+    vec3 base = vec3(0.75,0.04,0.03);
+    vec3 col = base*(vec3(0.06,0.07,0.1)+KEY_COL*max(dot(n,KEY_DIR),0.)*0.5+FRONT_COL*max(dot(n,FRONT_DIR),0.)+MOON_COL*max(dot(n,MOON_DIR),0.)*0.5);
+    col += env(r)*mix(base*0.9+0.08,vec3(1),fr)*0.6;
+    return col;
+  }
+  vec3 n = nGlass(p);
+  float a = atan(q.z,q.x);
+  vec3 T = normalize(vec3(-q.z,0.,q.x));
+  vec3 B = normalize(cross(n,T));
+  // condensation droplets
+  float wet = smoothstep(1.72,1.55,q.y)*smoothstep(0.02,0.1,q.y);
+  vec2 cs = vec2(a*0.316, q.y);
+  float dropMask = 0.0, dropEdge = 0.0; vec2 dropOff = vec2(0);
+  for(int lvl=0; lvl<2; lvl++){
+    float sc = lvl==0 ? 15.0 : 40.0;
+    vec2 g = cs*sc; vec2 gi = floor(g), gf = fract(g);
+    for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){
+      vec2 o = vec2(i,j);
+      vec2 h = hash22(gi+o+float(lvl)*31.7);
+      if(h.x < (lvl==0?0.55:0.62)) continue;
+      vec2 c = o + 0.2+0.6*h - gf;
+      c.y *= 0.85+0.3*h.y; // slight vertical stretch
+      float rad = (lvl==0? 0.14+0.24*h.y : 0.16+0.16*h.x);
+      float dl = length(c)/rad;
+      if(dl<1.0 && dl < 1.0 - dropMask*0.5){
+        dropMask = 1.0; dropOff = -c/rad; dropEdge = dl;
+      }
+    }
+  }
+  dropMask *= wet;
+  if(dropMask>0.0){
+    n = normalize(n + (T*dropOff.x + B*dropOff.y)*0.9);
+  }
+  float frost = wet*(1.0-dropMask)*0.8;
+
+  float cosi = max(dot(-rd,n),0.);
+  float F = 0.04+0.96*pow(1.-cosi,5.);
+  vec3 refl = env(reflect(rd,n));
+
+  bool label = q.y>0.80 && q.y<1.20;
+  vec3 col;
+  if(label){
+    vec2 uv = vec2(0.5 - a/(2.*PI), (q.y-0.80)/0.40);
+    uv -= dropOff*dropMask*vec2(0.004,0.02);
+    vec3 lab = texture(uLabel, uv).rgb;
+    lab = pow(lab, vec3(2.2));
+    vec3 nb = nGlass(p);
+    float dif = 0.0;
+    vec3 lit = vec3(0.05,0.055,0.08)
+      + KEY_COL*max(dot(nb,KEY_DIR),0.)*0.35
+      + FRONT_COL*1.5*max(dot(nb,FRONT_DIR),0.)
+      + MOON_COL*max(dot(nb,MOON_DIR),0.)*0.6;
+    col = lab*lit;
+    // translucent label glows red from behind (backlit by key)
+    col += lab*vec3(1.0,0.4,0.25)*KEY_COL*0.10*max(dot(-nb,KEY_DIR),0.);
+    col = mix(col, refl, (F*0.9+0.03)*(1.0-0.97*dropMask));
+    if(dropMask>0.0) col *= 1.0+0.35*(1.0-dropEdge);
+    col += frost*0.04*(FRONT_COL+MOON_COL);
+  } else {
+    // refraction through the cola
+    vec3 rdi = refract(rd,n,1.0/1.45);
+    if(dot(rdi,rdi)<0.5) rdi = reflect(rd,n);
+    vec3 e = p - n*0.004;
+    float t = 0.0, liq = 0.0;
+    vec3 pi = e;
+    for(int i=0;i<40;i++){
+      pi = e+rdi*t;
+      float dd = -sdGlass(pi);
+      if(dd<0.0015) break;
+      float st = max(dd,0.006);
+      if(pi.y-BP.y<FILL) liq += st;
+      t += st;
+    }
+    vec3 pe = e+rdi*t;
+    vec3 ne = nGlass(pe);
+    float inLiquid = step(q.y,FILL);
+    float eta = mix(1.45,1.33,inLiquid);
+    vec3 rdo = refract(rdi,-ne,eta);
+    vec3 bg;
+    if(dot(rdo,rdo)<0.5){ bg = env(reflect(rdi,-ne))*0.5; } else { bg = transmitSample(pe,rdo); }
+    vec3 qe = pe-BP;
+    if(qe.y>0.80&&qe.y<1.20){ // looking at the back of the label from inside
+      vec2 uv = vec2(0.5 - atan(qe.z,qe.x)/(2.*PI),(qe.y-0.80)/0.40);
+      vec3 lab = pow(texture(uLabel,uv).rgb,vec3(2.2));
+      bg = lab*KEY_COL*0.10*max(dot(ne,-KEY_DIR)+0.3,0.) + lab*0.02;
+    }
+    vec3 sigma = vec3(2.4,6.2,10.5);
+    vec3 att = exp(-sigma*liq) * mix(vec3(0.92,0.97,0.93), vec3(1.0), 1.0-inLiquid);
+    vec3 trans = bg*att;
+    // warm in-scattering so the cola reads as deep amber rather than black
+    trans += vec3(0.20,0.040,0.010)*(1.0-exp(-liq*2.0))*(0.25+0.9*max(dot(rdi,-KEY_DIR)*0.5+0.5,0.));
+    if(inLiquid>0.5) trans += bubbles(e,rdi,t);
+    trans *= (1.0-frost*0.35);
+    col = mix(trans, refl, F);
+    col += frost*0.06*(KEY_COL*0.25*max(dot(n,KEY_DIR)+0.5,0.)+FRONT_COL+MOON_COL*0.5);
+  }
+  // droplet highlights / dark rim (lensing)
+  if(dropMask>0.0){
+    col *= mix(1.0,0.35,smoothstep(0.6,1.0,dropEdge));
+    vec3 r2 = reflect(rd,n);
+    if(!label) col += env(r2)*0.10*dropMask;
+    col += FRONT_COL*pow(max(dot(r2,FRONT_DIR),0.),80.)*2.0*dropMask;
+    col += KEY_COL*pow(max(dot(r2,KEY_DIR),0.),60.)*1.5;
+  }
+  return col;
+}
+
+vec3 shadeOrn(vec3 p, vec3 rd, int id){
+  vec3 n = nOrn(p);
+  vec3 r = reflect(rd,n);
+  int ball = id/2; bool cap = (id%2)==1;
+  vec3 base = cap ? vec3(0.75,0.68,0.55) : (ball==1 ? vec3(1.0,0.72,0.32) : vec3(0.85,0.03,0.04));
+  float rough = 0.0;
+  float occ = bottleShadow(p+n*0.01,KEY_DIR);
+  vec3 dif = base*(vec3(0.03,0.04,0.07)+KEY_COL*max(dot(n,KEY_DIR),0.)*0.25*occ+FRONT_COL*max(dot(n,FRONT_DIR),0.)*0.5);
+  float fr = pow(1.-max(dot(-rd,n),0.),5.);
+  vec3 spec = env(r)*mix(base, vec3(1.0), fr);
+  // glitter band on the red ornament
+  if(ball==0 && !cap){ vec3 q = p-ORN[0].xyz; float band = smoothstep(0.018,0.012,abs(q.y+0.01));
+    float gl = step(0.7,hash13(floor(p*400.)));
+    spec = mix(spec, (KEY_COL*0.6+FRONT_COL)*gl*1.5+vec3(0.6,0.5,0.3)*0.2, band); }
+  return dif*0.6 + spec*0.85;
+}
+
+// ---------- snowflakes ----------
+vec3 snowflakes(vec3 ro, vec3 rd, float sceneT){
+  vec3 acc = vec3(0);
+  for(int L=0; L<5; L++){
+    float fl = float(L);
+    float depth = 0.9*pow(1.75,fl);         // 0.9 .. 8.4
+    float g = 0.42*depth;                   // cell size grows with depth
+    vec3 P = ro+rd*depth;
+    vec3 drift = vec3(0.25*sin(uTime*0.4+fl*1.3), -uTime*(0.32+0.05*fl), 0.12*cos(uTime*0.33+fl));
+    vec3 Q = (P-drift)/g + fl*17.3;
+    vec3 gi = floor(Q), gf = fract(Q);
+    vec3 off = step(0.5,gf)*2.0-1.0;
+    for(int k=0;k<8;k++){
+      vec3 o = vec3(k&1, (k>>1)&1, (k>>2)&1)*off;
+      vec3 cell = gi+o;
+      vec3 h = hash33(cell);
+      if(h.x>0.55) continue;
+      vec3 c = (cell+0.25+0.5*h - fl*17.3)*g + drift;
+      c += 0.03*g*vec3(sin(uTime*1.7+h.y*30.),0,cos(uTime*1.3+h.z*30.));
+      vec3 v = c-ro;
+      float z = dot(v,rd);
+      if(z<0.25||z>sceneT) continue;
+      float pd = length(v-rd*z);
+      float size = (0.006+0.010*h.z);
+      float coc = uAper*abs(z-uFocus)/uFocus;   // world-space blur radius at depth z
+      float rad = max(size, coc);
+      float px = rad/z*pxScale;
+      float e = 1.0/max(px,1.0);
+      float disc = smoothstep(1.0,1.0-1.5*e-0.15,pd/rad);
+      float energy = (size*size)/(rad*rad);
+      acc += vec3(0.92,0.95,1.0)*disc*clamp(energy*1.6,0.04,1.6)*(0.55+0.45*h.y);
+    }
+  }
+  return acc;
+}
+
+void main(){
+  pxScale = 0.5*uRes.y/uTanFov;
+  cFw = normalize(uCamTgt-uCamPos);
+  cRt = normalize(cross(cFw,vec3(0,1,0)));
+  cUp = cross(cRt,cFw);
+  vec2 uv = (gl_FragCoord.xy-0.5*uRes)/(0.5*uRes.y);
+  vec3 ro = uCamPos;
+  vec3 rd = normalize(cFw + (uv.x*cRt+uv.y*cUp)*uTanFov);
+
+  float t = 0.0; vec2 h = vec2(1e3,0.);
+  bool hit=false;
+  for(int i=0;i<180;i++){
+    h = map(ro+rd*t);
+    if(h.x<0.0004*t){ hit=true; break; }
+    t += h.x;
+    if(t>25.0) break;
+  }
+  vec3 col; float depth;
+  bool preBlurred = false;
+  if(hit){
+    vec3 p = ro+rd*t;
+    if(h.y<2.5) col = shadeBottle(p,rd,h.y);
+    else if(h.y>3.5) col = shadeOrn(p,rd,int(h.y-4.0+0.5));
+    else {
+      col = shadeSnow(p,rd,t,false);
+      float fog = smoothstep(4.0,12.0,t);
+      if(fog>0.0) col += background(rd)*fog;
+    }
+    depth = t*dot(rd,cFw);
+  } else {
+    col = background(rd);
+    preBlurred = true; t = 1e3; depth = 1e3;
+  }
+  col += snowflakes(ro,rd,t);
+  col = max(col,0.0);
+  fragColor = vec4(col, preBlurred ? -1.0 : depth);
+}
+</script>
+
+<!-- ===================== DOF PASS ===================== -->
+<script id="fsDof" type="x-shader">#version 300 es
+precision highp float;
+uniform sampler2D uTex; uniform vec2 uRes;
+uniform float uTanFov, uFocus, uAper;
+out vec4 fragColor;
+float coc(float d){ if(d<0.0) return 0.0; return min(uAper*abs(d-uFocus)/(d*uFocus)*0.5*uRes.y/uTanFov, 22.0); }
+void main(){
+  vec2 px = 1.0/uRes;
+  vec2 uv = gl_FragCoord.xy*px;
+  ivec2 ip = ivec2(gl_FragCoord.xy); ivec2 mx = ivec2(uRes)-1;
+  vec4 c0 = texelFetch(uTex,ip,0);
+  float dc = c0.a<0.0?1e3:c0.a;
+  float cc = coc(c0.a);
+  vec3 acc = c0.rgb; float wsum = 1.0;
+  const float GA = 2.39996323;
+  for(int i=1;i<64;i++){
+    float fi = float(i);
+    float r = sqrt(fi/63.0)*22.0;
+    vec2 o = vec2(cos(fi*GA),sin(fi*GA))*r;
+    vec4 s = texelFetch(uTex, clamp(ip+ivec2(round(o)),ivec2(0),mx), 0);
+    float ds = s.a<0.0?1e3:s.a;
+    float cs = coc(s.a);
+    if(ds>dc) cs = min(cs,cc);
+    float w = clamp((cs+1.0-r)/1.5, 0.0, 1.0);
+    acc += s.rgb*w; wsum += w;
+  }
+  fragColor = vec4(acc/wsum, c0.a);
+}
+</script>
+
+<!-- ===================== MIX / BRIGHT / BLUR / FINAL ===================== -->
+<script id="fsMix" type="x-shader">#version 300 es
+precision highp float;
+uniform sampler2D uA, uB; uniform float uW; uniform vec2 uRes;
+out vec4 fragColor;
+void main(){ vec2 uv = gl_FragCoord.xy/uRes; fragColor = vec4(mix(texture(uA,uv).rgb, texture(uB,uv).rgb, uW),1.0); }
+</script>
+<script id="fsBright" type="x-shader">#version 300 es
+precision highp float;
+uniform sampler2D uTex; uniform vec2 uRes; uniform vec2 uSrcPx;
+out vec4 fragColor;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes;
+  vec3 c = vec3(0);
+  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++) c += texture(uTex, uv+vec2(i,j)*uSrcPx*1.5).rgb;
+  c /= 9.0;
+  float l = dot(c,vec3(0.3,0.5,0.2));
+  fragColor = vec4(c*smoothstep(0.55,1.6,l),1.0);
+}
+</script>
+<script id="fsBlur" type="x-shader">#version 300 es
+precision highp float;
+uniform sampler2D uTex; uniform vec2 uRes; uniform vec2 uDir;
+out vec4 fragColor;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes;
+  vec3 c = vec3(0); float ws=0.0;
+  for(int i=-12;i<=12;i++){ float w = exp(-float(i*i)/50.0); c += texture(uTex, uv+uDir*float(i)/uRes).rgb*w; ws+=w; }
+  fragColor = vec4(c/ws,1.0);
+}
+</script>
+<script id="fsFinal" type="x-shader">#version 300 es
+precision highp float;
+uniform sampler2D uTex, uBloom; uniform vec2 uRes; uniform float uFade, uTime, uExposure;
+out vec4 fragColor;
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.,1.); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes;
+  vec2 dc = (uv-0.5);
+  // subtle chromatic aberration toward edges
+  float ca = 0.0018*dot(dc,dc)*4.0;
+  vec3 c;
+  c.r = texture(uTex, uv - dc*ca).r;
+  c.g = texture(uTex, uv).g;
+  c.b = texture(uTex, uv + dc*ca).b;
+  vec3 b = texture(uBloom, uv).rgb;
+  c += b*0.55;
+  c *= uExposure;
+  c = aces(c);
+  // warm filmic grade
+  c = pow(c, vec3(1.0/2.2));
+  c = mix(c, c*vec3(1.03,0.99,0.97), 0.6);
+  c = mix(vec3(dot(c,vec3(0.299,0.587,0.114))), c, 1.12);
+  c = clamp(c,0.,1.); c = mix(c, c*c*(3.0-2.0*c), 0.35);
+  float lum = dot(c,vec3(0.299,0.587,0.114));
+  c += (1.0-lum)*(1.0-lum)*vec3(-0.012,0.0,0.03) + lum*lum*vec3(0.02,0.008,-0.02);
+  float vig = smoothstep(1.05,0.25,length(dc*vec2(1.25,1.0)));
+  c *= mix(0.55,1.0,vig);
+  c += (hash12(gl_FragCoord.xy+fract(uTime*7.13)*1000.0)-0.5)*0.022;
+  c *= uFade;
+  fragColor = vec4(c,1.0);
+}
+</script>
+
+<script>
+const W = 1920, H = 1080;
+const glc = document.getElementById('gl');
+const gl = glc.getContext('webgl2', {preserveDrawingBuffer:true, antialias:false});
+if(!gl.getExtension('EXT_color_buffer_float')) throw new Error('no float RT');
+gl.getExtension('OES_texture_float_linear');
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src.trim()); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fsId){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, document.getElementById(fsId).textContent));
+  gl.bindAttribLocation(p,0,'aPos'); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for(let i=0;i<n;i++){ const info = gl.getActiveUniform(p,i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return {p,u};
+}
+const P = { scene: program('fsScene'), dof: program('fsDof'), mix: program('fsMix'),
+            bright: program('fsBright'), blur: program('fsBlur'), fin: program('fsFinal') };
+
+const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+
+function rt(w,h){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  return {t,f,w,h};
+}
+const BW = W/4, BH = H/4;
+const T = { sceneA: rt(W,H), dofA: rt(W,H), dofB: rt(W,H), mix: rt(W,H), b1: rt(BW,BH), b2: rt(BW,BH) };
+
+// ---------- label texture (2D canvas) ----------
+function makeLabel(){
+  const c = document.createElement('canvas'); c.width=2048; c.height=512;
+  const x = c.getContext('2d');
+  const g = x.createLinearGradient(0,0,0,512);
+  g.addColorStop(0,'#b70d18'); g.addColorStop(0.5,'#e5111e'); g.addColorStop(1,'#b20c16');
+  x.fillStyle=g; x.fillRect(0,0,2048,512);
+  // thin trims
+  x.fillStyle='rgba(255,255,255,0.9)'; x.fillRect(0,14,2048,6); x.fillRect(0,492,2048,6);
+  // white dynamic ribbon wave
+  x.beginPath();
+  for(let i=0;i<=2048;i+=8){ const y = 370 + 34*Math.sin(i/2048*Math.PI*4+0.6); i==0?x.moveTo(i,y):x.lineTo(i,y); }
+  for(let i=2048;i>=0;i-=8){ const y = 400 + 30*Math.sin(i/2048*Math.PI*4+1.1); x.lineTo(i,y); }
+  x.closePath(); x.fillStyle='#ffffff'; x.fill();
+  // brand script (two faces around the bottle)
+  for(const cx of [512,1536]){
+    x.save(); x.translate(cx,250); x.transform(1,0,-0.18,1,0,0);
+    x.font='italic bold 140px "Liberation Serif", serif'; x.textAlign='center'; x.textBaseline='middle';
+    x.lineWidth=6; x.strokeStyle='rgba(120,0,8,0.5)'; x.strokeText('Coca-Cola',0,0);
+    x.fillStyle='#ffffff'; x.fillText('Coca-Cola',0,0);
+    x.restore();
+    x.font='bold 34px "DejaVu Sans", sans-serif'; x.textAlign='center'; x.fillStyle='rgba(255,255,255,0.92)';
+    x.save(); x.translate(cx,84); x.fillText('ORIGINAL TASTE',0,0); x.restore();
+  }
+  // tiny snowflake marks
+  x.fillStyle='rgba(255,255,255,0.85)';
+  for(const cx of [1024,0,2048]){ x.font='60px "DejaVu Sans"'; x.textAlign='center'; x.fillText('❄',cx,270); }
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,c);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  return t;
+}
+const labelTex = makeLabel();
+
+// ---------- shots ----------
+const lerp=(a,b,t)=>a+(b-a)*t, lerp3=(a,b,t)=>a.map((v,i)=>lerp(v,b[i],t));
+const ease=t=>{t=Math.min(Math.max(t,0),1);return t*t*(3-2*t);};
+const sstep=(a,b,x)=>ease((x-a)/(b-a));
+const deg=d=>Math.tan(d*Math.PI/360);
+function shotA(t){ // 0..5.25 : slow push-in through the snowfall
+  const u = t/5.25, e = 0.35*u+0.65*ease(u);
+  const pos = lerp3([0.55,0.42,5.8],[0.22,0.70,3.75],e);
+  const tgt = lerp3([0,1.05,0],[0,0.98,0],e);
+  const dist = Math.hypot(pos[0]-tgt[0],pos[1]-tgt[1],pos[2]-tgt[2]);
+  return {pos,tgt,tanFov:deg(32),focus:dist-0.31,aper:0.045};
+}
+function shotB(t){ // 4.75..10.25 : macro slide up the cold bottle
+  const u = (t-4.75)/5.5;
+  const th = lerp(-0.50,-0.02,u), d = lerp(1.22,1.02,u), y = lerp(0.50,1.52,ease(u)*0.6+u*0.4);
+  const pos = [Math.sin(th)*d, y+0.04, Math.cos(th)*d];
+  const tgt = [0, y-0.03, 0];
+  return {pos,tgt,tanFov:deg(26),focus:d-0.30,aper:0.022};
+}
+function shotC(t){ // 9.75..15 : pull back, bottle left, end card
+  const u = (t-9.75)/5.25, e = ease(u)*0.7+u*0.3;
+  const th = lerp(0.42,0.12,e), d = lerp(3.0,4.5,e), h = lerp(1.15,0.92,e);
+  const right = [Math.cos(th),0,-Math.sin(th)];
+  const pos = [Math.sin(th)*d, h, Math.cos(th)*d];
+  const off = 0.78*d/4.5;
+  const tgt = [right[0]*off, 0.98, right[2]*off];
+  return {pos,tgt,tanFov:deg(32),focus:d-0.3,aper:0.04};
+}
+function shotsAt(t){
+  if(t<4.75) return [[shotA(t),1]];
+  if(t<5.25) return [[shotA(t),1],[shotB(t),sstep(4.75,5.25,t)]];
+  if(t<9.75) return [[shotB(t),1]];
+  if(t<10.25) return [[shotB(t),1],[shotC(t),sstep(9.75,10.25,t)]];
+  return [[shotC(t),1]];
+}
+
+function bindTex(unit, tex){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, tex); }
+function draw(target, w, h, tiles){
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target?target.f:null);
+  gl.viewport(0,0,w,h);
+  if(!tiles){ gl.drawArrays(gl.TRIANGLE_STRIP,0,4); return; }
+  gl.enable(gl.SCISSOR_TEST);
+  const n = tiles;
+  for(let i=0;i<n;i++){ const y0 = Math.floor(h*i/n), y1 = Math.floor(h*(i+1)/n); gl.scissor(0,y0,w,y1-y0); gl.drawArrays(gl.TRIANGLE_STRIP,0,4); gl.finish(); }
+  gl.disable(gl.SCISSOR_TEST);
+}
+function renderShot(cam, t, out){
+  let s = P.scene; gl.useProgram(s.p);
+  gl.uniform2f(s.u.uRes,W,H); gl.uniform1f(s.u.uTime,t);
+  gl.uniform3fv(s.u.uCamPos,cam.pos); gl.uniform3fv(s.u.uCamTgt,cam.tgt);
+  gl.uniform1f(s.u.uTanFov,cam.tanFov); gl.uniform1f(s.u.uFocus,cam.focus); gl.uniform1f(s.u.uAper,cam.aper);
+  bindTex(0,labelTex); gl.uniform1i(s.u.uLabel,0);
+  draw(T.sceneA,W,H,12);
+  if(window.NODOF){ s = P.mix; gl.useProgram(s.p); bindTex(0,T.sceneA.t); bindTex(1,T.sceneA.t);
+    gl.uniform1i(s.u.uA,0); gl.uniform1i(s.u.uB,1); gl.uniform1f(s.u.uW,0); gl.uniform2f(s.u.uRes,W,H); draw(out,W,H); return; }
+  s = P.dof; gl.useProgram(s.p);
+  bindTex(0,T.sceneA.t); gl.uniform1i(s.u.uTex,0); gl.uniform2f(s.u.uRes,W,H);
+  gl.uniform1f(s.u.uTanFov,cam.tanFov); gl.uniform1f(s.u.uFocus,cam.focus); gl.uniform1f(s.u.uAper,cam.aper);
+  draw(out,W,H,4);
+}
+
+const out = document.getElementById('out'); const ctx = out.getContext('2d');
+function overlay(t){
+  const a1 = sstep(10.5,11.2,t), a2 = sstep(11.3,12.1,t), a3 = sstep(12.3,13.0,t);
+  const fadeOut = 1 - sstep(14.55,14.98,t);
+  if(a1<=0) return;
+  const cx = W*0.665;
+  ctx.save();
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  // line 1
+  ctx.globalAlpha = a1*fadeOut;
+  ctx.font = '600 34px "DejaVu Sans", sans-serif';
+  ctx.letterSpacing = '9px';
+  ctx.fillStyle = '#f6e7d2'; ctx.shadowColor='rgba(255,170,90,0.55)'; ctx.shadowBlur=18;
+  ctx.fillText('ПРАЗДНИК К НАМ ПРИХОДИТ', cx, H*0.34 + (1-a1)*18);
+  ctx.letterSpacing = '0px';
+  // brand
+  if(a2>0){
+    ctx.globalAlpha = a2*fadeOut;
+    const sc = 0.94+0.06*a2;
+    ctx.save(); ctx.translate(cx, H*0.49); ctx.scale(sc,sc); ctx.transform(1,0,-0.16,1,0,0);
+    ctx.font = 'italic bold 168px "Liberation Serif", serif';
+    ctx.shadowColor='rgba(255,30,40,0.85)'; ctx.shadowBlur=45;
+    ctx.fillStyle='#ffffff'; ctx.fillText('Coca-Cola',0,0);
+    ctx.shadowBlur=0; ctx.fillText('Coca-Cola',0,0);
+    ctx.restore();
+    // ribbon under the brand
+    ctx.globalAlpha = a2*fadeOut*0.95;
+    ctx.beginPath();
+    const w2 = 330*a2;
+    for(let i=-w2;i<=w2;i+=4){ const y = H*0.575 + 8*Math.sin(i/110); i==-w2?ctx.moveTo(cx+i,y):ctx.lineTo(cx+i,y); }
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=5; ctx.shadowColor='rgba(255,40,40,0.8)'; ctx.shadowBlur=16; ctx.stroke();
+  }
+  if(a3>0){
+    ctx.globalAlpha = a3*fadeOut;
+    ctx.font = 'italic 64px "Liberation Serif", serif';
+    ctx.fillStyle='#ffd99a'; ctx.shadowColor='rgba(255,160,60,0.8)'; ctx.shadowBlur=24;
+    ctx.fillText('С Новым годом!', cx, H*0.655 + (1-a3)*14);
+  }
+  ctx.restore();
+}
+
+window.renderFrame = function(t){
+  const shots = shotsAt(t);
+  renderShot(shots[0][0], t, T.dofA);
+  let w = 0;
+  if(shots.length>1){ renderShot(shots[1][0], t, T.dofB); w = shots[1][1]; }
+  let s = P.mix; gl.useProgram(s.p);
+  bindTex(0,T.dofA.t); bindTex(1, shots.length>1?T.dofB.t:T.dofA.t);
+  gl.uniform1i(s.u.uA,0); gl.uniform1i(s.u.uB,1); gl.uniform1f(s.u.uW,w); gl.uniform2f(s.u.uRes,W,H);
+  draw(T.mix,W,H);
+  s = P.bright; gl.useProgram(s.p); bindTex(0,T.mix.t); gl.uniform1i(s.u.uTex,0);
+  gl.uniform2f(s.u.uRes,BW,BH); gl.uniform2f(s.u.uSrcPx,1/W,1/H); draw(T.b1,BW,BH);
+  s = P.blur; gl.useProgram(s.p); gl.uniform1i(s.u.uTex,0); gl.uniform2f(s.u.uRes,BW,BH);
+  for(const k of [1,2.5]){
+    bindTex(0,T.b1.t); gl.uniform2f(s.u.uDir,k,0); draw(T.b2,BW,BH);
+    bindTex(0,T.b2.t); gl.uniform2f(s.u.uDir,0,k); draw(T.b1,BW,BH);
+  }
+  s = P.fin; gl.useProgram(s.p);
+  bindTex(0,T.mix.t); bindTex(1,T.b1.t); gl.uniform1i(s.u.uTex,0); gl.uniform1i(s.u.uBloom,1);
+  gl.uniform2f(s.u.uRes,W,H); gl.uniform1f(s.u.uTime,t); gl.uniform1f(s.u.uExposure,1.25);
+  const fade = sstep(0.0,0.9,t) * (1 - sstep(14.6,15.0,t)*0.9);
+  gl.uniform1f(s.u.uFade, fade);
+  draw(null,W,H);
+  gl.finish();
+  ctx.clearRect(0,0,W,H);
+  ctx.drawImage(glc,0,0);
+  overlay(t);
+  return out.toDataURL('image/jpeg', 0.96);
+};
+window.ready = true;
+</script>
+</body>
+</html>
