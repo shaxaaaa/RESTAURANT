@@ -1,0 +1,404 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Asmo binti Abu Bakr — film</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const W = 1920, H = 1080;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingQuality = 'high';
+const params = new URLSearchParams(location.search);
+const PLATES = params.get('plates') || 'build/plates';
+const SANS = '"DejaVu Sans", sans-serif', SERIF = '"FreeSerif", "Liberation Serif", serif', AR = '"DejaVu Sans", sans-serif';
+const GOLD = '#d9b26a', CREAM = '#f3e7cf', SAND = '#c9a77a', BROWN = '#2a1c12';
+
+// ---------- helpers ----------
+const clamp = (x, a, b) => Math.min(Math.max(x, a), b);
+const ease = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const lerp = (a, b, t) => a + (b - a) * t;
+const fadeWin = (t, a, b, fi = 0.6, fo = 0.6) => Math.min(ease((t - a) / fi), ease((b - t) / fo));
+function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+// ---------- assets ----------
+const names = ['dunes_sunrise', 'dunes_golden', 'valley_dawn', 'valley_close', 'valley_night', 'alley', 'cave_wide', 'cave_close',
+  'still_whole', 'still_split', 'belt_whole', 'belt_split', 'desk_wide', 'desk_macro', 'desk_books', 'hall', 'hall_halqa', 'arches'];
+const IMG = {};
+let narration = null;
+const loads = names.map(n => new Promise((res, rej) => { const i = new Image(); i.onload = () => { IMG[n] = i; res(); }; i.onerror = () => rej(new Error('missing plate ' + n)); i.src = PLATES + '/' + n + '.jpg'; }));
+loads.push(new Promise(res => { const chk = () => window.NARRATION ? (narration = window.NARRATION, res()) : setTimeout(chk, 30); chk(); }));
+
+// film grain tiles
+const grain = [];
+for (let k = 0; k < 6; k++) {
+  const g = document.createElement('canvas'); g.width = 480; g.height = 270;
+  const gx = g.getContext('2d'); const id = gx.createImageData(480, 270); const r = rng(77 + k);
+  for (let i = 0; i < id.data.length; i += 4) { const v = 128 + (r() - 0.5) * 90; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+  gx.putImageData(id, 0, 0); grain.push(g);
+}
+// 8-fold geometric pattern tile (gold lines on transparent)
+function starPattern(size, lw, color) {
+  const g = document.createElement('canvas'); g.width = g.height = size; const x = g.getContext('2d');
+  x.strokeStyle = color; x.lineWidth = lw; x.lineJoin = 'round';
+  const s = size / 2, r1 = size * 0.36, r2 = size * 0.20;
+  const star = (cx, cy) => { x.beginPath(); for (let i = 0; i <= 16; i++) { const a = i * Math.PI / 8 - Math.PI / 2; const r = i % 2 ? r2 : r1; const px = cx + Math.cos(a) * r, py = cy + Math.sin(a) * r; i ? x.lineTo(px, py) : x.moveTo(px, py); } x.stroke(); };
+  star(s, s); star(0, 0); star(size, 0); star(0, size); star(size, size);
+  x.beginPath(); for (const [ax, ay, bx, by] of [[s, s - r1, s, 0], [s, s + r1, s, size], [s - r1, s, 0, s], [s + r1, s, size, s]]) { x.moveTo(ax, ay); x.lineTo(bx, by); } x.stroke();
+  return g;
+}
+const pattern = starPattern(220, 2, 'rgba(217,178,106,0.9)');
+
+// ---------- edit decision list ----------
+// k0/k1: Ken Burns keyframes {s: zoom (1 = fill), x, y: focus point in plate fractions}
+const SHOTS = [
+  { a: 0.0, b: 9.0, p: 'dunes_sunrise', k0: { s: 1.0, x: 0.50, y: 0.52 }, k1: { s: 1.14, x: 0.55, y: 0.55 }, fx: 'sand' },
+  { a: 8.0, b: 16.0, p: 'valley_dawn', k0: { s: 1.02, x: 0.45, y: 0.5 }, k1: { s: 1.15, x: 0.52, y: 0.56 }, fx: 'sand' },
+  { a: 15.0, b: 23.0, p: 'valley_close', k0: { s: 1.12, x: 0.42, y: 0.55 }, k1: { s: 1.04, x: 0.56, y: 0.52 } },
+  { a: 22.0, b: 31.0, p: 'alley', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.18, x: 0.5, y: 0.47 }, fx: 'dust' },
+  { a: 30.0, b: 40.0, p: 'desk_books', k0: { s: 1.05, x: 0.45, y: 0.55 }, k1: { s: 1.16, x: 0.55, y: 0.6 }, fx: 'dust' },
+  { a: 39.0, b: 44.6, p: 'valley_night', k0: { s: 1.08, x: 0.5, y: 0.5 }, k1: { s: 1.0, x: 0.5, y: 0.52 } },
+  { a: 43.6, b: 49.0, p: 'cave_close', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.12, x: 0.5, y: 0.52 }, fx: 'sand' },
+  { a: 48.0, b: 56.0, p: 'still_whole', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.10, x: 0.48, y: 0.56 }, fx: 'dust' },
+  { a: 55.0, b: 66.0, p: 'belt_whole', p2: 'belt_split', wipe: [58.6, 62.4], k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.10, x: 0.46, y: 0.55 }, fx: 'dust' },
+  { a: 65.0, b: 76.0, p: 'still_split', k0: { s: 1.12, x: 0.5, y: 0.62 }, k1: { s: 1.0, x: 0.5, y: 0.52 }, fx: 'dust', dim: 0.35 },
+  { a: 75.0, b: 86.0, p: 'desk_wide', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.14, x: 0.52, y: 0.5 }, fx: 'lamp' },
+  { a: 85.0, b: 97.0, p: 'desk_macro', k0: { s: 1.14, x: 0.62, y: 0.45 }, k1: { s: 1.06, x: 0.40, y: 0.6 }, fx: 'lamp' },
+  { a: 96.0, b: 111.0, p: 'hall', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.16, x: 0.5, y: 0.55 }, fx: 'dust' },
+  { a: 110.0, b: 117.5, p: 'hall_halqa', k0: { s: 1.12, x: 0.45, y: 0.5 }, k1: { s: 1.0, x: 0.52, y: 0.5 }, fx: 'dust' },
+  { a: 116.5, b: 146.0, p: 'desk_books', k0: { s: 1.2, x: 0.4, y: 0.5 }, k1: { s: 1.1, x: 0.6, y: 0.5 }, dim: 0.72, blur: 6, diagram: true },
+  { a: 145.0, b: 160.5, p: 'dunes_golden', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.12, x: 0.56, y: 0.55 }, fx: 'sand' },
+  { a: 159.5, b: 180.0, p: 'arches', k0: { s: 1.0, x: 0.5, y: 0.5 }, k1: { s: 1.16, x: 0.52, y: 0.48 }, fx: 'dust' },
+];
+
+function drawPlate(img, k, alpha, blur) {
+  const base = Math.max(W / img.width, H / img.height);
+  const sc = base * k.s;
+  const vw = W / sc, vh = H / sc;
+  let sx = k.x * img.width - vw / 2, sy = k.y * img.height - vh / 2;
+  sx = clamp(sx, 0, img.width - vw); sy = clamp(sy, 0, img.height - vh);
+  ctx.globalAlpha = alpha;
+  if (blur) ctx.filter = `blur(${blur}px)`;
+  ctx.drawImage(img, sx, sy, vw, vh, 0, 0, W, H);
+  ctx.filter = 'none'; ctx.globalAlpha = 1;
+}
+const wipeCanvas = document.createElement('canvas'); wipeCanvas.width = W; wipeCanvas.height = H;
+const wctx = wipeCanvas.getContext('2d');
+
+function drawShot(sh, t, alpha) {
+  const u = (t - sh.a) / (sh.b - sh.a);
+  const e = 0.25 * u + 0.75 * ease(u);
+  const k = { s: lerp(sh.k0.s, sh.k1.s, e), x: lerp(sh.k0.x, sh.k1.x, e), y: lerp(sh.k0.y, sh.k1.y, e) };
+  drawPlate(IMG[sh.p], k, alpha, sh.blur);
+  if (sh.p2) { // belt being divided: soft wipe along the length (right to left)
+    const w = ease((t - sh.wipe[0]) / (sh.wipe[1] - sh.wipe[0]));
+    if (w > 0) {
+      wctx.clearRect(0, 0, W, H);
+      const ctxSave = ctx; // draw split plate into wipe canvas
+      const base = Math.max(W / IMG[sh.p2].width, H / IMG[sh.p2].height), sc = base * k.s, vw = W / sc, vh = H / sc;
+      let sx = clamp(k.x * IMG[sh.p2].width - vw / 2, 0, IMG[sh.p2].width - vw), sy = clamp(k.y * IMG[sh.p2].height - vh / 2, 0, IMG[sh.p2].height - vh);
+      wctx.drawImage(IMG[sh.p2], sx, sy, vw, vh, 0, 0, W, H);
+      const edge = lerp(W * 1.15, -W * 0.15, w);
+      const g = wctx.createLinearGradient(edge - 140, 0, edge + 140, 0);
+      g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,1)');
+      wctx.globalCompositeOperation = 'destination-in'; wctx.fillStyle = g; wctx.fillRect(0, 0, W, H);
+      wctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = alpha; ctx.drawImage(wipeCanvas, 0, 0); ctx.globalAlpha = 1;
+    }
+  }
+  if (sh.dim) { ctx.fillStyle = `rgba(16,10,6,${sh.dim * alpha * ease((t - sh.a) / 1.5)})`; ctx.fillRect(0, 0, W, H); }
+}
+
+// ---------- particles ----------
+function dust(t, alpha, warm = true, n = 70) {
+  const r = rng(9);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < n; i++) {
+    const x0 = r() * W, y0 = r() * H, sz = 1.5 + r() * r() * 9, sp = 6 + r() * 18, ph = r() * 6.28;
+    const x = (x0 + t * sp * (0.5 + r()) + Math.sin(t * 0.3 + ph) * 30) % (W + 40) - 20;
+    const y = (y0 - t * sp * 0.4 + Math.cos(t * 0.23 + ph) * 25 + H * 10) % (H + 40) - 20;
+    const a = alpha * (0.05 + 0.10 * r()) * (0.6 + 0.4 * Math.sin(t * 1.3 + ph));
+    const g = ctx.createRadialGradient(x, y, 0, x, y, sz * 2);
+    g.addColorStop(0, warm ? `rgba(255,220,170,${a})` : `rgba(220,230,255,${a})`); g.addColorStop(1, 'rgba(255,220,170,0)');
+    ctx.fillStyle = g; ctx.fillRect(x - sz * 2, y - sz * 2, sz * 4, sz * 4);
+  }
+  ctx.restore();
+}
+function sand(t, alpha) { // drifting sand haze near the ground
+  const r = rng(5);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 46; i++) {
+    const y = H * (0.62 + 0.38 * r()), len = 120 + r() * 380, sp = 60 + r() * 140, x0 = r() * W;
+    const x = (x0 + t * sp) % (W + len) - len;
+    const a = alpha * (0.02 + 0.035 * r());
+    const g = ctx.createLinearGradient(x, 0, x + len, 0);
+    g.addColorStop(0, 'rgba(255,215,160,0)'); g.addColorStop(0.5, `rgba(255,215,160,${a})`); g.addColorStop(1, 'rgba(255,215,160,0)');
+    ctx.fillStyle = g; ctx.fillRect(x, y, len, 2 + r() * 3);
+  }
+  ctx.restore();
+}
+function lampFlicker(t, alpha) {
+  const f = 0.85 + 0.08 * Math.sin(t * 11.3) + 0.05 * Math.sin(t * 23.7 + 1) + 0.04 * Math.sin(t * 5.1);
+  ctx.save(); ctx.globalCompositeOperation = 'soft-light';
+  ctx.fillStyle = `rgba(255,170,90,${0.18 * alpha * f})`; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// ---------- typography ----------
+function spaced(text, x, y, font, color, spacing, align = 'center', shadow = 0) {
+  ctx.font = font; ctx.letterSpacing = spacing + 'px'; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (shadow) { ctx.shadowColor = 'rgba(0,0,0,0.65)'; ctx.shadowBlur = shadow; }
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+  ctx.shadowBlur = 0; ctx.letterSpacing = '0px';
+}
+function ornament(cx, cy, w, a) {
+  ctx.save(); ctx.globalAlpha = a; ctx.strokeStyle = GOLD; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(cx - w, cy); ctx.lineTo(cx - 18, cy); ctx.moveTo(cx + 18, cy); ctx.lineTo(cx + w, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - 9); ctx.lineTo(cx + 9, cy); ctx.lineTo(cx, cy + 9); ctx.lineTo(cx - 9, cy); ctx.closePath(); ctx.stroke();
+  ctx.restore();
+}
+function panel(x, y, w, h, a) {
+  ctx.save(); ctx.globalAlpha = a;
+  const g = ctx.createLinearGradient(x, y, x, y + h); g.addColorStop(0, 'rgba(30,20,12,0.78)'); g.addColorStop(1, 'rgba(22,14,8,0.86)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(217,178,106,0.75)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+}
+function keyTerm(t, a, b, label, sub, ar) { // lower-left chip highlighting a key term
+  const al = fadeWin(t, a, b, 0.5, 0.6); if (al <= 0) return;
+  const x = 90 + (1 - easeOut((t - a) / 0.6)) * -30, y = 96;
+  ctx.font = `bold 34px ${SANS}`; ctx.letterSpacing = '5px';
+  const w = Math.max(ctx.measureText(label).width + 70, sub ? 360 : 0); ctx.letterSpacing = '0px';
+  panel(x, y, w, sub ? 112 : 70, al);
+  ctx.save(); ctx.globalAlpha = al;
+  spaced(label, x + 34, y + 36, `bold 34px ${SANS}`, GOLD, 5, 'left');
+  if (sub) spaced(sub, x + 34, y + 82, `italic 27px ${SERIF}`, CREAM, 0.5, 'left');
+  ctx.restore();
+}
+
+// ---------- titles & graphics per scene ----------
+function openingTitle(t) {
+  const a = fadeWin(t, 2.2, 13.6, 1.4, 1.2); if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  const g = ctx.createRadialGradient(W / 2, H * 0.4, 50, W / 2, H * 0.4, 820);
+  g.addColorStop(0, 'rgba(20,12,6,0.42)'); g.addColorStop(1, 'rgba(20,12,6,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.direction = 'rtl'; spaced('أسماء بنت أبي بكر رضي الله عنهما', W / 2, H * 0.29, `40px ${AR}`, 'rgba(240,215,160,0.92)', 0, 'center', 12); ctx.direction = 'ltr';
+  const rise = (1 - easeOut((t - 2.2) / 2.0)) * 20;
+  spaced('ASMO BINTI ABU BAKR', W / 2, H * 0.395 + rise, `bold 92px ${SERIF}`, '#f2d9a4', 14, 'center', 28);
+  ornament(W / 2, H * 0.47, 330 * easeOut((t - 3.0) / 1.5), a);
+  const a2 = fadeWin(t, 3.6, 13.6, 1.2, 1.2);
+  ctx.globalAlpha = a2;
+  spaced('Jasorat, sadoqat va ilm timsoli', W / 2, H * 0.535, `italic 46px ${SERIF}`, CREAM, 1.5, 'center', 16);
+  ctx.restore();
+}
+function nameCards(t) {
+  const items = [
+    [15.8, 22.0, 'Asmo binti Abu Bakr as-Siddiq', 'Kunyasi: Ummu Abdulloh'],
+    [22.0, 29.2, 'Otasi: Abu Bakr as-Siddiq', 'Singlisi (ota bir): Oisha roziyallohu anho'],
+    [29.4, 38.8, 'Turmush oʻrtogʻi:', 'Zubayr ibn Avvom roziyallohu anhu'],
+  ];
+  for (const [a, b, l1, l2] of items) {
+    const al = fadeWin(t, a, b, 0.6, 0.6); if (al <= 0) continue;
+    const x = 90, y = 90 + (1 - easeOut((t - a) / 0.7)) * 16;
+    ctx.font = `bold 38px ${SERIF}`; const w1 = ctx.measureText(l1).width; ctx.font = `32px ${SERIF}`; const w = Math.max(w1, ctx.measureText(l2).width) + 80;
+    panel(x, y, w, 128, al);
+    ctx.save(); ctx.globalAlpha = al;
+    spaced(l1, x + 38, y + 44, `bold 38px ${SERIF}`, GOLD, 0.5, 'left');
+    spaced(l2, x + 38, y + 90, `32px ${SERIF}`, CREAM, 0.3, 'left');
+    ctx.restore();
+  }
+}
+function nitaqTitle(t) {
+  const a = fadeWin(t, 66.8, 75.4, 1.0, 0.8); if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.globalAlpha = a * 0.18; const pr = ctx.createPattern(pattern, 'repeat'); ctx.fillStyle = pr;
+  ctx.save(); ctx.translate(W / 2, H * 0.42); ctx.rotate(t * 0.01); ctx.fillRect(-W, -H, 2 * W, 2 * H); ctx.restore();
+  ctx.globalAlpha = a;
+  const g = ctx.createRadialGradient(W / 2, H * 0.42, 60, W / 2, H * 0.42, 700); g.addColorStop(0, 'rgba(18,10,5,0.70)'); g.addColorStop(1, 'rgba(18,10,5,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.direction = 'rtl'; spaced('ذات النطاقين', W / 2, H * 0.27, `64px ${AR}`, '#e9c98a', 0, 'center', 14); ctx.direction = 'ltr';
+  spaced('ZOTUN-NITOQAYN', W / 2, H * 0.40, `bold 96px ${SERIF}`, '#f2d9a4', 10, 'center', 26);
+  ornament(W / 2, H * 0.475, 300 * easeOut((t - 67.5) / 1.4), a);
+  spaced('“ikki belbogʻ sohibasi”', W / 2, H * 0.535, `italic 46px ${SERIF}`, CREAM, 1, 'center', 14);
+  const a3 = fadeWin(t, 71.0, 75.4, 0.8, 0.8); ctx.globalAlpha = a3;
+  spaced('Sahihi Buxoriy, 2979 va 3907-hadislar', W / 2, H * 0.6, `26px ${SANS}`, 'rgba(230,210,170,0.9)', 2, 'center', 10);
+  ctx.restore();
+}
+function hadithCards(t) {
+  keyTerm(t, 40.5, 47.6, 'HIJRAT', 'Makkadan Madinaga');
+  keyTerm(t, 75.8, 82.2, 'HADIS ILMI', 'sahobiya roviya');
+  const cards = [
+    [83.4, 96.6, '58', 'rivoyat', 'Imom Zahabiy, “Siyar aʼlom an-nubalo”'],
+    [91.0, 96.6, '13', 'tasi “Sahihayn”da', 'Imom Buxoriy va Imom Muslim'],
+  ];
+  cards.forEach(([a, b, big, word, src], i) => {
+    const al = fadeWin(t, a, b, 0.6, 0.7); if (al <= 0) return;
+    const x = W - 700, y = 110 + i * 190 + (1 - easeOut((t - a) / 0.7)) * 18;
+    panel(x, y, 600, 160, al);
+    ctx.save(); ctx.globalAlpha = al;
+    spaced(big, x + 40, y + 70, `bold 88px ${SERIF}`, GOLD, 0, 'left');
+    spaced(word, x + 175, y + 60, `36px ${SERIF}`, CREAM, 0, 'left');
+    spaced(src, x + 175, y + 108, `21px ${SANS}`, 'rgba(230,210,170,0.85)', 0.5, 'left');
+    ctx.restore();
+  });
+  const al = fadeWin(t, 97.0, 101.8, 0.6, 0.6);
+  if (al > 0) { panel(W / 2 - 430, 100, 860, 78, al); ctx.save(); ctx.globalAlpha = al; spaced('Har bir rivoyatning oʻz sanadi va darajasi bor', W / 2, 139, `italic 34px ${SERIF}`, CREAM, 0.5); ctx.restore(); }
+  const topics = [['Namoz', 102.4], ['Poklik', 103.4], ['Sadaqa', 104.4], ['Onaga yaxshilik', 105.6]];
+  topics.forEach(([w, a], i) => {
+    const al2 = fadeWin(t, a, 110.0, 0.5, 0.6); if (al2 <= 0) return;
+    const x = 110 + i * 300; panel(x, 104, w.length > 10 ? 340 : 250, 66, al2);
+    ctx.save(); ctx.globalAlpha = al2; spaced(w, x + (w.length > 10 ? 170 : 125), 138, `34px ${SERIF}`, GOLD, 0.5); ctx.restore();
+  });
+}
+
+// transmission diagram (scene 5)
+function diagram(t) {
+  const A = fadeWin(t, 116.8, 145.6, 1.0, 0.8); if (A <= 0) return;
+  const nodes = {
+    asmo: { x: W / 2, y: 175, l1: 'Asmo binti Abu Bakr', l2: 'roziyallohu anho', at: 117.0, main: true },
+    abd: { x: 330, y: 470, l1: 'Abdulloh ibn Zubayr', l2: 'oʻgʻli', at: 118.4 },
+    urva: { x: 800, y: 470, l1: 'Urva ibn Zubayr', l2: 'oʻgʻli · Madina faqihi', at: 120.6 },
+    fot: { x: 1270, y: 470, l1: 'Fotima binti Munzir', l2: 'nevarasi', at: 131.2 },
+    mul: { x: 1650, y: 470, l1: 'Ibn Abu Mulayka', l2: 'tobeʼin', at: 139.6 },
+    hish: { x: 1035, y: 735, l1: 'Hishom ibn Urva', l2: 'Urvaning oʻgʻli', at: 134.6 },
+  };
+  const edges = [['asmo', 'abd', 118.4], ['asmo', 'urva', 120.6], ['asmo', 'fot', 131.2], ['asmo', 'mul', 139.6], ['urva', 'hish', 134.6], ['fot', 'hish', 135.4]];
+  ctx.save();
+  ctx.globalAlpha = A * 0.10; ctx.fillStyle = ctx.createPattern(pattern, 'repeat'); ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = A;
+  spaced('ILMNING AVLODDAN AVLODGA OʻTISHI', W / 2, 62, `bold 30px ${SANS}`, 'rgba(217,178,106,0.95)', 6);
+  for (const [f, to, at] of edges) {
+    const p = easeOut((t - at) / 1.1); if (p <= 0) continue;
+    const a = nodes[f], b = nodes[to];
+    const y0 = a.y + 52, y1 = b.y - 52;
+    ctx.strokeStyle = 'rgba(217,178,106,0.85)'; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    const mx = (a.x + b.x) / 2, my = (y0 + y1) / 2;
+    const steps = 40; for (let i = 0; i <= steps * p; i++) { const s = i / steps; const x = (1 - s) ** 2 * a.x + 2 * (1 - s) * s * a.x + s * s * b.x; const y = (1 - s) ** 2 * y0 + 2 * (1 - s) * s * my + s * s * y1; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
+  }
+  for (const k in nodes) {
+    const n = nodes[k]; const a = easeOut((t - n.at) / 0.8); if (a <= 0) continue;
+    ctx.save(); ctx.globalAlpha = A * a;
+    ctx.font = `bold ${n.main ? 40 : 32}px ${SERIF}`; const w = Math.max(ctx.measureText(n.l1).width + 60, 300);
+    const h = n.main ? 112 : 98;
+    panel(n.x - w / 2, n.y - h / 2 + (1 - a) * 12, w, h, 1);
+    spaced(n.l1, n.x, n.y - 14 + (1 - a) * 12, `bold ${n.main ? 40 : 32}px ${SERIF}`, n.main ? '#f2d9a4' : GOLD, 0.3);
+    spaced(n.l2, n.x, n.y + 26 + (1 - a) * 12, `italic ${n.main ? 28 : 25}px ${SERIF}`, CREAM, 0.3);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function lessons(t) {
+  const items = [[151.0, '1', 'Qiyin damlarda jasorat va xizmat'], [155.5, '2', 'Ilm olish va uni asrashga sadoqat'], [160.3, '3', 'Foydali ilmni avlodlarga yetkazish']];
+  const head = fadeWin(t, 146.0, 165.6, 0.8, 0.8);
+  if (head > 0) { ctx.save(); ctx.globalAlpha = head; spaced('UCH SABOQ', 140, 150, `bold 40px ${SANS}`, GOLD, 10, 'left', 14); ornament(310, 196, 170, head); ctx.restore(); }
+  items.forEach(([a, n, txt], i) => {
+    const al = fadeWin(t, a, 165.6, 0.7, 0.8); if (al <= 0) return;
+    const y = 250 + i * 128, x = 120 + (1 - easeOut((t - a) / 0.8)) * -40;
+    panel(x, y, 820, 100, al);
+    ctx.save(); ctx.globalAlpha = al;
+    ctx.beginPath(); ctx.arc(x + 58, y + 50, 30, 0, Math.PI * 2); ctx.strokeStyle = GOLD; ctx.lineWidth = 2; ctx.stroke();
+    spaced(n, x + 58, y + 52, `bold 36px ${SERIF}`, GOLD, 0);
+    spaced(txt, x + 112, y + 51, `38px ${SERIF}`, CREAM, 0.3, 'left');
+    ctx.restore();
+  });
+}
+function finalCard(t) {
+  const a = ease((t - 175.6) / 1.4) * (1 - ease((t - 179.1) / 0.9)); if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgba(14,9,5,0.62)'; ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = a * 0.12; ctx.fillStyle = ctx.createPattern(pattern, 'repeat'); ctx.fillRect(0, 0, W, H); ctx.globalAlpha = a;
+  spaced('Ilm — omonat.', W / 2, H * 0.43, `bold 84px ${SERIF}`, '#f2d9a4', 3, 'center', 24);
+  ornament(W / 2, H * 0.51, 280, a);
+  spaced('Uni asrash va yetkazish — mas’uliyat.', W / 2, H * 0.585, `italic 54px ${SERIF}`, CREAM, 1, 'center', 18);
+  ctx.restore();
+}
+
+// ---------- subtitles ----------
+let SUBS = [];
+function buildSubs() {
+  for (const s of narration.segments) {
+    const total = s.subs.reduce((n, x) => n + x.length, 0);
+    let t = s.start;
+    for (const line of s.subs) {
+      const d = (s.end - s.start) * line.length / total;
+      SUBS.push({ a: t, b: t + d, text: line }); t += d;
+    }
+  }
+}
+const HL = ['Zotun-nitoqayn', 'Hijrat', 'hadis', 'ellik sakkizta', 'Sahihi Buxoriy'];
+function richRuns(text) {
+  const runs = []; let i = 0;
+  while (i < text.length) {
+    let best = null;
+    for (const h of HL) { const j = text.indexOf(h, i); if (j >= 0 && (!best || j < best[0])) best = [j, h]; }
+    if (!best) { runs.push([text.slice(i), false]); break; }
+    if (best[0] > i) runs.push([text.slice(i, best[0]), false]);
+    runs.push([best[1], true]); i = best[0] + best[1].length;
+  }
+  return runs;
+}
+function subtitles(t) {
+  const s = SUBS.find(x => t >= x.a && t < x.b + 0.05); if (!s) return;
+  const al = Math.min(ease((t - s.a) / 0.18), ease((s.b + 0.05 - t) / 0.15));
+  const font = `40px ${SANS}`; ctx.font = font;
+  const runs = richRuns(s.text);
+  const width = runs.reduce((w, [x, h]) => { ctx.font = h ? `bold 40px ${SANS}` : font; return w + ctx.measureText(x).width; }, 0);
+  const y = H - 92;
+  ctx.save(); ctx.globalAlpha = al;
+  const pad = 28; const g = ctx.createLinearGradient(0, y - 40, 0, y + 40);
+  g.addColorStop(0, 'rgba(12,8,5,0.62)'); g.addColorStop(1, 'rgba(12,8,5,0.70)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(W / 2 - width / 2 - pad, y - 38, width + pad * 2, 76, 8); ctx.fill();
+  let x = W / 2 - width / 2; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  for (const [txt, h] of runs) {
+    ctx.font = h ? `bold 40px ${SANS}` : font; ctx.fillStyle = h ? '#e8c27a' : '#f6efe1';
+    ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 6;
+    ctx.fillText(txt, x, y + 1); x += ctx.measureText(txt).width;
+  }
+  ctx.restore();
+}
+
+// ---------- frame ----------
+function grade() {
+  // gentle warm film look, vignette, grain
+  ctx.save();
+  ctx.globalCompositeOperation = 'soft-light'; ctx.fillStyle = 'rgba(190,140,90,0.22)'; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+  const v = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 1.05);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(10,6,3,0.55)');
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+function addGrain(t) {
+  ctx.save(); ctx.globalCompositeOperation = 'overlay'; ctx.globalAlpha = 0.10;
+  ctx.drawImage(grain[Math.floor(t * 25) % grain.length], 0, 0, W, H); ctx.restore();
+}
+
+window.renderFrame = function (t) {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const active = SHOTS.filter(s => t >= s.a && t < s.b);
+  active.forEach((sh, i) => {
+    let al = 1;
+    if (i > 0) al = ease((t - sh.a) / 1.0); // dissolve over the earlier shot
+    drawShot(sh, t, al);
+    if (sh.fx === 'dust') dust(t, al);
+    if (sh.fx === 'sand') sand(t, al);
+    if (sh.fx === 'lamp') { lampFlicker(t, al); dust(t, al * 0.7); }
+  });
+  grade();
+  // titles
+  openingTitle(t); nameCards(t); hadithCards(t); nitaqTitle(t); diagram(t); lessons(t);
+  subtitles(t);
+  finalCard(t);
+  addGrain(t);
+  // global fades
+  const fin = ease(t / 1.6), fout = 1 - ease((t - 179.0) / 1.0);
+  const f = Math.min(fin, fout);
+  if (f < 1) { ctx.fillStyle = `rgba(0,0,0,${1 - f})`; ctx.fillRect(0, 0, W, H); }
+  return cv.toDataURL('image/jpeg', 0.93);
+};
+Promise.all(loads).then(() => { buildSubs(); window.ready = true; }).catch(e => { window.loadError = e.message; });
+</script>
+</body></html>
